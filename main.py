@@ -5,14 +5,16 @@ from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import jwt
 
-import models, schemas
+import models
+import schemas
 from database import engine, get_db
 
+# Initialize database tables
 models.Base.metadata.create_all(bind=engine)
 
 SECRET_KEY = "super-secret-key-change-this-in-production"
@@ -36,23 +38,27 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-def verify_password(plain_password, hashed_password):
+
+# --- Helper Security & Utility Functions ---
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def create_access_token(data: dict):
+def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-@app.post("/signup", response_model=dict)
+
+# --- Authentication Endpoints ---
+@app.post("/signup", response_model=dict, status_code=status.HTTP_201_CREATED)
 def signup(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
     
     hashed_pwd = get_password_hash(user.password)
     new_user = models.User(username=user.username, hashed_password=hashed_pwd, role=user.role)
@@ -65,7 +71,7 @@ def signup(user: schemas.UserCreate, db: Session = Depends(get_db)):
 def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if not db_user or not verify_password(user.password, db_user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
     
     access_token = create_access_token(data={"sub": db_user.username, "role": db_user.role})
     return {
@@ -76,11 +82,14 @@ def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
         "role": db_user.role
     }
 
+
+# --- Project Endpoints ---
 @app.post("/projects", status_code=status.HTTP_201_CREATED)
 def create_project(project: schemas.ProjectCreate, db: Session = Depends(get_db)):
     db_project = db.query(models.Project).filter(models.Project.name == project.name).first()
     if db_project:
-        raise HTTPException(status_code=400, detail="Project already exists")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Project already exists")
+    
     new_project = models.Project(name=project.name, description=project.description, budget=project.budget)
     db.add(new_project)
     db.commit()
@@ -102,9 +111,14 @@ def get_projects(db: Session = Depends(get_db)):
         })
     return result
 
-# --- NEW: Category Budget Endpoints ---
+
+# --- Category Budget Endpoints ---
 @app.post("/category-budgets", status_code=status.HTTP_201_CREATED)
 def set_category_budget(data: schemas.CategoryBudgetCreate, db: Session = Depends(get_db)):
+    project = db.query(models.Project).filter(models.Project.id == data.project_id).first()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
     existing = db.query(models.CategoryBudget).filter(
         models.CategoryBudget.project_id == data.project_id,
         models.CategoryBudget.category == data.category
@@ -126,7 +140,7 @@ def set_category_budget(data: schemas.CategoryBudgetCreate, db: Session = Depend
 def get_project_summary(project_id: int, db: Session = Depends(get_db)):
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     
     limits = {cb.category: cb.limit_amount for cb in project.category_budgets}
     
@@ -149,8 +163,9 @@ def get_project_summary(project_id: int, db: Session = Depends(get_db)):
         })
     
     return {"summary": summary, "alerts": alerts}
-# -------------------------------------
 
+
+# --- Expense Endpoints ---
 @app.post("/expenses", status_code=status.HTTP_201_CREATED)
 async def add_expense(
     title: str = Form(...),
@@ -161,9 +176,17 @@ async def add_expense(
     receipt: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db)
 ):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        
+    project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
     receipt_path = None
     if receipt:
-        file_filename = f"{datetime.utcnow().timestamp()}_{receipt.filename}"
+        file_filename = f"{int(datetime.utcnow().timestamp())}_{receipt.filename}"
         file_location = os.path.join(UPLOAD_DIR, file_filename)
         with open(file_location, "wb+") as file_object:
             file_object.write(await receipt.read())
@@ -216,6 +239,8 @@ def get_expenses(
         })
     return results
 
+
+# --- Export Endpoint ---
 @app.get("/export-csv")
 def export_csv(db: Session = Depends(get_db)):
     expenses = db.query(models.Expense).all()
@@ -227,4 +252,28 @@ def export_csv(db: Session = Depends(get_db)):
             u_name = exp.user.username if exp.user else "N/A"
             yield f"{exp.id},\"{p_name}\",\"{u_name}\",\"{exp.category}\",\"{exp.title}\",{exp.amount},{exp.date}\n"
 
-    return StreamingResponse(iter_csv(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=expense_report.csv"})
+    return StreamingResponse(
+        iter_csv(), 
+        media_type="text/csv", 
+        headers={"Content-Disposition": "attachment; filename=expense_report.csv"}
+    )
+
+
+# --- Standard FastAPI Static Files Mounting ---
+app.mount("/assets", StaticFiles(directory="static/assets"), name="assets")
+
+@app.get("/")
+def read_index():
+    return FileResponse("static/index.html")
+
+@app.get("/{path:path}")
+def catch_all(path: str):
+    # Allow API endpoints to pass through normally
+    if path.startswith(("signup", "login", "projects", "category-budgets", "expenses", "export-csv", "uploads", "docs", "openapi.json")):
+        raise HTTPException(status_code=404, detail="Not Found")
+    
+    # Serve static files if they exist, otherwise fallback to index.html for React router
+    file_path = os.path.join("static", path)
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    return FileResponse("static/index.html")
